@@ -1,0 +1,945 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+Name: Carol Muriithi
+---
+
+
+```{r}
+#Sys.setenv(OMPATH=”/Users/smonti/Google\ Drive/BS831”)
+Sys.setenv(OMPATH='/Users/carolmuriithi/Google\ Drive/BS831')
+
+OMPATH <- Sys.getenv("OMPATH")
+
+require(Biobase)
+require(limma)
+```
+
+
+```{r}
+#Data Load & Preprocessing
+#We first load the CPM (count per million)-normalized data
+## read CPM data
+CPM <- readRDS( file.path(OMPATH,"data/HNSC_htseq_normalized_AEvsG1vsG3.RDS") )
+
+## show the distribution of 'grades'
+table(CPM$grade)
+
+```
+
+
+```{r}
+## show the distribution of 'stages'
+table(CPM$stage)
+```
+
+```{r}
+## simplify stage by grouping categories (i,ii,iii -> lo; iv -> hi)
+stage <- factor(c("AE","stage.lo","stage.lo","stage.lo","stage.hi")[CPM$stage],
+                levels=c("AE","stage.lo","stage.hi"))
+CPM$stage <- stage
+## look at the "cross-stratification" of grade and stage
+table(CPM$grade,CPM$stage)
+
+```
+
+##Exercise 1: Pathway Enrichment Analysis
+You are asked to carry out geneset enrichment analysis with respect to the phenotype “g1 vs. g3” using the hallmark geneset compendium from MSigDB. Save the results object in the file final.exercise1.RDS.
+
+read.gmt function
+Let us define a simple read.gmt function to … read a ‘.gmt’ file. There are probably smarter (more elegant) ways. Anybody?
+
+```{r}
+read.gmt.sample <- function( gmt.file ) {
+    gmt <- scan(gmt.file,"character",sep="\n")
+    gmt <- lapply(gmt,function(Z) unlist(strsplit(Z,"\t"))[-2])
+    names(gmt) <- sapply(gmt,function(Z) Z[1])
+    gmt <- lapply(gmt,function(Z) Z[-1])
+}
+hall <- read.gmt.sample( file.path(OMPATH,"data/h.all.v6.1.symbols.gmt") )
+print(head(names(hall))) # show first few genesets
+
+```
+#Preparing the data Next, we extract the samples corresponding to grades g1 and g3 only. We also log2-transform the data.
+
+```{r}
+g1vsg3 <- CPM[,CPM$grade %in% c("g1","g3")]
+g1vsg3$grade <- droplevels(g1vsg3$grade)
+exprs(g1vsg3) <- log2(exprs(g1vsg3)+1)
+
+```
+
+#Compute gene ranking based on t.test
+
+```{r}
+ttest <- as.data.frame(
+  t(apply(exprs(g1vsg3),1,
+          function(y) {
+            out <- t.test(y~as.factor(g1vsg3$grade))
+            c(score.t=out$statistic, pval=out$p.value)
+            })))
+
+```
+
+
+```{r}
+ttest.order<-ttest[order(ttest$score.t),] 
+head(ttest.order)
+```
+
+#ks.genescore
+
+```{r}
+source( file.path(OMPATH,"code/ksGenescore.R") )
+
+```
+
+```{r}
+ttest.order$ensembl_gene_id<-rownames(ttest.order)
+```
+
+
+```{r}
+test<-merge(ttest.order, fData(g1vsg3)[,c("ensembl_gene_id","hgnc_symbol")],  by="ensembl_gene_id")
+```
+
+```{r}
+test.order<-test[order(test$score.t),] 
+```
+
+
+```{r}
+N<-nrow(ttest.order) # total number of gene
+```
+
+```{r}
+ KShall <- data.frame(ks.score=double(), p.value=double())
+   N<-nrow(ttest.order)
+
+
+for (i in 1:50){
+   unlist<-unlist(hall[i])
+   index<-match(unlist, test.order$hgnc_symbol) 
+   h<-na.omit(sort(index))
+   
+ 
+   KSoutput<-ksGenescore(N, h, do.plot = F)
+   
+   KShall[i,1] <-as.numeric(KSoutput$statistic)
+   KShall[i,2] <-KSoutput$p.value
+   rownames(KShall)[i]<-names(hall)[i]
+   
+
+}
+
+
+```
+
+```{r}
+KShall$q.value <- p.adjust(KShall$p.value, method="BH")
+
+```
+
+
+```{r}
+
+#KShall$q.value <- p.adjust(KShall$p.value,method="BH")
+#rownames(KShall) <- gsub("HALLMARK_","",rownames(KShall))
+#save(KShall,file=file.path(SCCPATH,"<student id>/final.exercise1.RDS"))
+#print(head(KShall))
+
+rownames(KShall) <- gsub("HALLMARK_","",rownames(KShall))
+#save(KShall,file=file.path(SCCPATH,"<student id>/final.exercise1.RDS"))
+#saveRDS(limmaRes0, file=file.path("/Users/carolmuriithi/","homework2_limmaRes0.RDS"))
+save(KShall,file=file.path("/Users/carolmuriithi/", "/final.exercise1.RDS"))
+print(head(KShall))
+
+```
+
+#Gene Filtering
+Next, filter out genes with mostly zero counts. We perform zero filtering by ‘recycling’ the script defined in the Rmodule_DiffanalRNAseq module.
+
+```{r}
+#Gene Filtering
+## Remove those genes without at least 1 read per million in at least
+## 'n' samples, where n is the number of samples in the 'smallest'
+## phenotype class
+removeLowExpression <- function(eset, class_id, min.thresh=0)
+{
+  groups <- pData(eset)[,class_id]
+  min.samples <-
+    max(min.thresh,min( sapply(levels(groups), function(x){length(which(groups %in% x))})))
+  rpm <- colSums(exprs(eset))/1000000
+  filter_ind <- t(apply(exprs(eset), 1,function(x) {x >rpm}))
+  filter_ind_rowsums <- apply(filter_ind, 1, sum)
+  return(eset[filter_ind_rowsums > min.samples,])
+}
+CPM1 <- removeLowExpression(eset=CPM, class_id="grade", min.thresh=4)
+print(dim(CPM1))
+
+```
+
+
+
+##Take 2 delete
+```{r}
+## Remove those genes without at least 1 read per million in at least
+## 'n' samples, where n is the number of samples in the 'smallest'
+## phenotype class
+removeLowExpression <- function(eset, class_id, min.thresh=0)
+{
+  groups <- pData(eset)[,class_id]
+  min.samples <-
+    max(min.thresh,min( sapply(levels(groups), function(x){length(which(groups %in% x))})))
+  rpm <- colSums(exprs(eset))/1000000
+  filter_ind <- t(apply(exprs(eset), 1,function(x) {x >rpm}))
+  filter_ind_rowsums <- apply(filter_ind, 1, sum)
+  return(eset[filter_ind_rowsums > min.samples,])
+}
+CPM1 <- removeLowExpression(eset=CPM, class_id="grade", min.thresh=4)
+print(dim(CPM1))
+
+
+```
+
+
+```{r}
+## let us log-transform the CPM data for subsequent handling
+exprs(CPM1) <- log2(exprs(CPM1)+1)
+
+```
+
+#Exercise 2: Testing for Normality of Gene Distributions
+Next, we test the normality of the CPM-normalized data using ks.test (remember that the data is log2-transformed).
+
+In this exercise, you are asked to test each gene for its deviation from normality by ks.test, and store the results in a data.frame to be saved to  final.exercise2.RDS.
+
+Here, we show the test applied to a single gene.
+
+```{r}
+## remember how you can use ks.test to test the difference btw two distributions
+ks.test( exprs(CPM1)[1,], "pnorm", mean=mean(exprs(CPM1)[1,]), sd=sd(exprs(CPM1)[1,]) )
+
+```
+
+Apparently, the first gene in the CPM1 dataset does not significantly deviates from normality (p-value = 0.7947).
+
+You are asked to perform the same test on every gene, and to save the output in tabular form. The results to be saved will look as follows.
+
+```{r}
+KStest<-apply(exprs(CPM1), 1,
+          function(y) {
+            out <- ks.test(unique(y), "pnorm", mean=mean(y), sd=sd(y))
+            c(statistic=out$statistic, p.value=out$p.value)}
+          )
+
+```
+
+```{r}
+KS<-as.data.frame(t(KStest))
+
+```
+
+
+```{r}
+KS$q.value <- p.adjust(KS$p.value,method="BH")
+
+```
+
+```{r}
+#saveRDS(KS, file=file.path(SCCPATH,"<studentID>/final.exercise2.RDS"))
+#saveRDS(limmaRes0, file=file.path("/Users/carolmuriithi/","homework2_limmaRes0.RDS"))
+saveRDS(KS, file=file.path("/Users/carolmuriithi/final.exercise2.RDS"))
+print(head(KS))
+
+```
+Here is a summary scatter plot to show the relationship between significance of the deviation from normality and expression level. You do not need to generate this (but you’re free to do it, if you wish).
+
+##CLUSTERING
+Hierarchical Clustering Next, you will be asked to perform hierarchical clustering of the log2-transformed, CPM-normalized data (CPM1) on both samples/columns and genes/rows (see Rmodule_hclust.Rmd).
+
+For this task, let us first drastically filter the genes, say, to ~2000, to make the clustering faster.
+
+```{r}
+source( file.path(OMPATH, "code/variationFilter.R") )
+
+## performing variation filtering in log space ..
+CPM2 <- variationFilter(CPM1,ngenes=2000, do.plot=FALSE)
+
+```
+##Next, let us perform hierarchical clustering based on hclust with ward.D as the agglomeration rule. You will have to choose the proper distance for each dimension.
+
+```{r}
+distC <- function(x) dist(t(x), method = "euclidean")
+distR <- function(x) stats::as.dist(1 - cor(t(x)))
+
+```
+
+```{r}
+distC.matrix<-distC(exprs(CPM2))
+distR.matrix<-distR(exprs(CPM2))
+```
+
+```{r}
+## clustering (choose the proper distances for the two dimensions - see slides)
+hc.col <- hclust( distC.matrix, method="ward.D" )
+hc.row <- hclust( distR.matrix, method="ward.D" )
+
+```
+
+```{r}
+source( file.path(OMPATH, "code/misc.R") )
+library("pheatmap")
+require(pheatmap)
+
+
+
+#source( file.path(OMPATH, "code/heatmap.R") )
+#require(pheatmap)
+#require(heatmap.plus)
+
+```
+
+
+```{r}
+## expression levels color coding
+bwrPalette <- colGradient(c("blue","white","red"),length=13)
+## sample annotation color coding
+annot <- pData(CPM2)[,c("grade","stage")]
+annotCol <- list(
+  grade = c("white","green","darkgreen"),
+  stage = c("white","green","darkgreen")
+)
+names(annotCol$grade) <- levels(annot$grade)
+names(annotCol$stage) <- levels(annot$stage)
+
+
+## heatmap visualization
+pheatmap(exprs(CPM2),
+         color=bwrPalette,
+         annotation_col = annot,
+         annotation_colors = annotCol,
+         cluster_rows=hc.row, # the result of the hclust call above
+         cluster_cols=hc.col, # ditto
+         show_rownames = FALSE,
+         show_colnames = FALSE,
+         scale = "row")
+
+```
+
+##EXERCISE3
+```{r}
+
+C3 <- cutree(hc.col,3)
+annot1 <- annot
+annotCol1 <- annotCol
+annot1$cluster <- factor(C3)
+annotCol1$cluster <- c("yellow","orange","purple")
+names(annotCol1$cluster) <- levels(annot1$cluster)
+
+pheatmap(exprs(CPM2),
+         color=bwrPalette,
+         annotation_col = annot1,
+         annotation_colors = annotCol1,
+         cluster_rows=hc.row,
+         cluster_cols=hc.col,
+         show_rownames = FALSE,
+         show_colnames = FALSE,
+         scale = "row")
+
+
+
+```
+
+You now are asked to test for association (or enrichment) of C3 membership with grade and stage by Fisher test.
+
+Below, we show the contingency table, and the summary of the corresponding Fisher test for grade. Notice that the enrichment is highly significant (although not perfect), and that each cluster has an over-representation of one of the three grade categories (“AE”, “g1”, or “g3”).
+
+Here’s the results.
+```{r}
+table.grade<-table(C3, CPM2$grade)
+table.grade
+
+```
+
+```{r}
+
+fisher.test(table.grade)
+
+```
+
+```{r}
+table.stage<-table(C3, CPM2$stage)
+table.stage
+
+```
+
+```{r}
+fisher.test(table.stage)
+```
+
+## RDS
+```{r}
+cluster.grade <- list(cluster1='AE',
+                      cluster2='g3',
+                      cluster3='g1')
+cluster.stage <- list(cluster1='AE',
+                      cluster2='stage.hi',
+                      cluster3='stage.lo')
+
+#saveRDS(limmaRes0, file=file.path("/Users/carolmuriithi/","homework2_limmaRes0.RDS"))
+
+saveRDS(cluster.grade,file=file.path("/Users/carolmuriithi/", "final.exercise3.grade.RDS"))
+
+saveRDS(cluster.stage,file=file.path("/Users/carolmuriithi/","final.exercise3.stage.RDS"))
+
+```
+
+#EXERCISE 4
+
+```{r}
+source( file.path(OMPATH, "code/hcopt.R") )
+require(cba) # load the necessary pacakge
+```
+
+```{r}
+ho.col <- hcopt(distC.matrix, method="ward.D" )
+ho.row <- hcopt(distR.matrix, method="ward.D" )
+
+```
+
+```{r}
+## expression levels color coding
+bwrPalette <- colGradient(c("blue","white","red"),length=13)
+## sample annotation color coding
+annot <- pData(CPM2)[,c("grade","stage")]
+annotCol <- list(
+  grade = c("white","green","darkgreen"),
+  stage = c("white","green","darkgreen")
+)
+names(annotCol$grade) <- levels(annot$grade)
+names(annotCol$stage) <- levels(annot$stage)
+
+
+## heatmap visualization
+pheatmap(exprs(CPM2),
+         color=bwrPalette,
+         annotation_col = annot,
+         annotation_colors = annotCol,
+         cluster_rows=ho.row, # the result of the hclust call above
+         cluster_cols=ho.col, # ditto
+         show_rownames = FALSE,
+         show_colnames = FALSE,
+         scale = "row")
+
+```
+
+In this exercise you are asked to:
+
+compute the distance between every pair of adjacent samples in the ordered dendrogram returned by hclust. compute the distance between every pair of adjacent samples in the ordered dendrogram returned by hcopt. compare the distribution of distances between the two. To perform the computations in 1 (and similarly 2), you will need to use the order returned by hclust (i.e., hc.col$order), and compute the n???1 Euclidean distances between every pair of adjacent samples according to the order (where n is the number of samples).
+
+Below, we show one possible way to compute the distances based on hclust (notice that hc.col is the variable where we saved the corresponding sample clustering results). There might be more elegant ways.
+```{r}
+
+hclust.pairs <- cbind(hc.col$order[-ncol(CPM2)],hc.col$order[-1])
+hclust.dist <- apply(hclust.pairs,1,function(X) dist(t(exprs(CPM2)[,X])))
+```
+
+```{r}
+hcopt.pairs <- cbind(ho.col$order[-ncol(CPM2)],ho.col$order[-1])
+hcopt.dist <- apply(hcopt.pairs,1,function(X) dist(t(exprs(CPM2)[,X])))
+
+```
+
+```{r}
+DIST <- data.frame(hclust=sort(hclust.dist),
+                   hcopt=sort(hcopt.dist))
+#saveRDS(limmaRes0, file=file.path("/Users/carolmuriithi/","homework2_limmaRes0.RDS"))
+saveRDS(DIST, file=file.path("/Users/carolmuriithi/","exercise4.RDS"))
+print(head(DIST))
+```
+
+
+
+```{r}
+DIST <- data.frame(hclust=sort(hclust.dist),
+                   hcopt=sort(hcopt.dist))
+saveRDS(DIST, file=file.path("/Users/carolmuriithi/","exercise4.RDS"))
+print(head(DIST))
+
+```
+
+We next plot the sorted distances based on the two orders. As you can see, most distances are larger in the hclust-based ordering than in the hcopt-based ordering, which is to be expected, since hcopt is specifically designed to chose the order that minimizes pairwise adjacent distances.
+```{r}
+
+
+plot(DIST$hclust,DIST$hcopt, xlab="sorted hclust distance",ylab="sorted hcopt distance")
+
+```
+
+## Classification
+
+```{r}
+require(limma)
+featureSelect <- function( DAT, CLS, nfeat, balanced=TRUE )
+{
+  ## BEGIN input checks
+  if ( class(DAT)!="ExpressionSet" ) stop( "'ExpressionSet' object expcted: ", class(DAT) )
+  if ( length(CLS)!=ncol(DAT) ) stop( "CLS and DAT have incompatible sizes" )
+  if ( length(unique(CLS))!=2 ) stop( "CLS must be a binary feature" )
+  if ( nfeat<1 | nfeat>nrow(DAT) ) stop( "nfeat must be in [1,nrow(DAT)]" )
+  ## END checks
+
+  design= model.matrix(~as.factor(CLS))
+  fitTrn <- lmFit(DAT,design)
+  fitTrn <- eBayes(fitTrn)
+  TT <- topTable(fitTrn,coef=2,number=Inf)
+
+  DAT1 <- {
+    if ( balanced ) # pick half markers in each direction
+      DAT[c(match(rownames(TT)[order(TT$t,decreasing=TRUE)[1:ceiling(nfeat/2)]],featureNames(DAT)),
+            match(rownames(TT)[order(TT$t,decreasing=FALSE)[1:ceiling(nfeat/2)]],featureNames(DAT))),]
+    else            # pick top markers irrespective of direction
+      DAT[match(rownames(TT)[order(abs(TT$t),decreasing=TRUE)[1:nfeat]],featureNames(DAT)),]
+  }
+  list(dat=DAT1,tbl=TT[match(featureNames(DAT1),rownames(TT)),])
+}
+
+```
+
+
+
+```{r}
+set.seed(1)
+require(caret)
+CPM3<-CPM2
+CPM3_notAE <- CPM3[, CPM3$grade != "AE"]
+CPM3_notAE$grade<- droplevels(CPM3_notAE$grade)
+```
+
+Create index that split CPM3 into two startified dataset
+
+```{r}
+CPM3_idx <- createDataPartition(CPM3_notAE$grade, p=0.6, list=FALSE, times=1)
+CPM3_train <- CPM3_notAE[, CPM3_idx]
+CPM3_test <- CPM3_notAE[, -CPM3_idx]
+```
+
+Evaluate, by 10-fold cross validation, classifiers based on 20, 50, 100, and 500 balanced features in the training (using the function featureSelect defined above). Use featureSelect to select features on the training set, prior to running cross validation. Note that this method of feature selection prior to performing cross-validation is biased, why? Use a classifier of your choice between RandomForest, Elastic Net, and SVM. You may use the caret package, as shown in class. Feel free to test more than one of the three classifiers, if you wish. Report the summary table with the performance of the different number-of-features/classifiers in terms of area under the ROC curve (AUC), sensitivity, and specificity.
+
+```{r}
+result <- featureSelect(CPM3_train, CPM3_train$grade == "g1", 20)
+train_x <- data.frame(t(Biobase::exprs(result$dat)))
+train_y <- result$dat$grade
+fitControl <- trainControl(method="cv",
+                           number=10,
+                           classProbs=T,
+                           summaryFunction=twoClassSummary)
+
+RF_20 <- train(x=train_x,
+             y=train_y,
+             method="rf", # random forest 
+             trControl=fitControl,
+             tuneGrid=expand.grid(mtry=c( 5,10,15, 20)),
+             metric='ROC')
+   #tuneGrid=expand.grid(mtry=c(32, 50, 100, 250, 500)),
+
+```
+
+```{r}
+RF_20
+```
+
+
+```{r}
+plot(RF_20, metric = "ROC")
+```
+
+
+```{r}
+
+## show the parameters that yield the most accurate classifier (as estimated by cv)
+RF_20$bestTune
+
+```
+
+```{r}
+#final model used and performance across test sets of each fold
+RF_20$finalModel
+
+```
+
+```{r}
+result <- featureSelect(CPM3_train, CPM3_train$grade == "g1", 50)
+train_x <- data.frame(t(Biobase::exprs(result$dat)))
+train_y <- result$dat$grade
+fitControl <- trainControl(method="cv",
+                           number=10,
+                           classProbs=T,
+                           summaryFunction=twoClassSummary)
+
+RF_50 <- train(x=train_x,
+             y=train_y,
+             method="rf", # random forest 
+             trControl=fitControl,
+             tuneGrid=expand.grid(mtry=c(20, 30, 50)),
+             metric='ROC')
+   #tuneGrid=expand.grid(mtry=c(32, 50, 100, 250, 500)),
+```
+
+
+```{r}
+RF_50 <- train(x=train_x,
+             y=train_y,
+             method="rf", # random forest 
+             trControl=fitControl,
+             tuneGrid=expand.grid(mtry=c(20,30, 50)),
+             metric='ROC')
+   #tuneGrid=expand.grid(mtry=c(32, 50, 100, 250, 500)),
+
+RF_50
+```
+
+```{r}
+plot(RF_50, metric = "ROC")
+```
+
+```{r}
+
+## show the parameters that yield the most accurate classifier (as estimated by cv)
+RF_50$bestTune
+
+```
+
+```{r}
+#final model used and performance across test sets of each fold
+RF_50$finalModel
+
+```
+
+```{r}
+result <- featureSelect(CPM3_train, CPM3_train$grade == "g1", 100)
+train_x <- data.frame(t(Biobase::exprs(result$dat)))
+train_y <- result$dat$grade
+fitControl <- trainControl(method="cv",
+                           number=10,
+                           classProbs=T,
+                           summaryFunction=twoClassSummary)
+
+RF_100 <- train(x=train_x,
+             y=train_y,
+             method="rf", # random forest 
+             trControl=fitControl,
+             tuneGrid=expand.grid(mtry=c(20, 30, 50,100)),
+             metric='ROC')
+   #tuneGrid=expand.grid(mtry=c(32, 50, 100, 250, 500)),
+```
+
+
+```{r}
+RF_100 <- train(x=train_x,
+             y=train_y,
+             method="rf", # random forest 
+             trControl=fitControl,
+             tuneGrid=expand.grid(mtry=c(20,30, 50,100)),
+             metric='ROC')
+   #tuneGrid=expand.grid(mtry=c(32, 50, 100, 250, 500)),
+
+RF_100
+```
+
+
+```{r}
+plot(RF_100, metric = "ROC")
+```
+
+```{r}
+
+## show the parameters that yield the most accurate classifier (as estimated by cv)
+RF_100$bestTune
+
+```
+
+```{r}
+#final model used and performance across test sets of each fold
+RF_100$finalModel
+
+```
+
+```{r}
+result <- featureSelect(CPM3_train, CPM3_train$grade == "g1", 500)
+train_x <- data.frame(t(Biobase::exprs(result$dat)))
+train_y <- result$dat$grade
+fitControl <- trainControl(method="cv",
+                           number=10,
+                           classProbs=T,
+                           summaryFunction=twoClassSummary)
+
+RF_500 <- train(x=train_x,
+             y=train_y,
+             method="rf", # random forest 
+             trControl=fitControl,
+             tuneGrid=expand.grid(mtry=c(20, 30, 50,100,500)),
+             metric='ROC')
+   #tuneGrid=expand.grid(mtry=c(32, 50, 100, 250, 500)),
+```
+
+
+```{r}
+RF_500
+```
+
+
+
+```{r}
+plot(RF_500, metric = "ROC")
+```
+
+
+```{r}
+
+## show the parameters that yield the most accurate classifier (as estimated by cv)
+RF_500$bestTune
+
+```
+
+
+
+```{r}
+#final model used and performance across test sets of each fold
+RF_500$finalModel
+
+```
+
+```{r}
+
+#CPM3_idx <- createDataPartition(CPM3_notAE$grade, p=0.6, list=FALSE, times=1)
+#CPM3_train <- CPM3_notAE[, CPM3_idx]
+#CPM3_test <- CPM3_notAE[, -CPM3_idx]
+#test <-data.frame(t(Biobase::exprs(CPM3_test)))
+
+#result1 <- featureSelect(CPM3_test, CPM3_test$grade == "g1", 500)
+test_x <- data.frame(t(Biobase::exprs(CPM3_test)))
+test_y <- CPM3_test$grade
+#fitControl <- trainControl(method="cv",
+                           #number=10,
+                           #classProbs=T,
+                           #summaryFunction=twoClassSummary)
+
+## predicting the validation data:
+predRF <- predict(RF_20,test_x)
+## or predicting using the probabilities (nice because you can get ROC)
+probsRF <- extractProb(list(model=RF_20),
+                     testX=test_x,
+                     testY=test_y)
+## removing trainings data
+probsRF <- probsRF[probsRF$dataType!='Training',]
+## Make sure the levels are appropriate for twoClassSummary(), ie case group is first level
+levs <- c("g1", "g3")
+probsRF$obs <- factor(probsRF$obs, levels = levs)
+probsRF$pred <- factor(probsRF$pred, levels = levs)
+## Calculating Accuracy
+mean(probsRF$obs==probsRF$pred)
+
+
+###
+#result <- featureSelect(CPM3_train, CPM3_train$grade == "g1", 20)
+#train_x <- data.frame(t(Biobase::exprs(result$dat)))
+#train_y <- result$dat$grade
+#fitControl <- trainControl(method="cv",
+                           #number=10,
+                           #classProbs=T,
+                           #summaryFunction=twoClassSummary)
+```
+
+```{r}
+ ## see classification prob for each sample in validation set
+## pred column shows model predicted label if cutoff for calling label = 0.5
+table(probsRF$obs, probsRF$pred)
+``` 
+ 
+ 
+ ## Best Model Combination is RF_20 
+```{r}
+## summary of performance result on validation set
+twoClassSummary(probsRF, lev = levels(probsRF$obs))
+#result <- featureSelect(CPM3_train, CPM3_train$grade == "g1", RF_20) # not complete yet
+``` 
+ 
+ 
+
+ ##Theirs
+ ## data partitioning into discovery and validation set
+CHEMICALGROUP <- pData(DM1000)[!duplicated(pData(DM1000)$CHEMICAL),c("CHEMICAL", "Carcinogen_liv")]
+discoveryCHEMICALindex <- createDataPartition(CHEMICALGROUP$Carcinogen_liv, p=0.6, list=FALSE, times=1)
+discoveryCHEMICAL <- CHEMICALGROUP$CHEMICAL[discoveryCHEMICALindex]
+validationCHEMICAL <- CHEMICALGROUP$CHEMICAL[-discoveryCHEMICALindex]
+## split data into discovery and validation set (all replicates belong to one or the other)
+DM1000discovery <- DM1000[,DM1000$CHEMICAL %in% discoveryCHEMICAL]
+DM1000validation <- DM1000[,DM1000$CHEMICAL %in% validationCHEMICAL]
+discovery <- data.frame(t(Biobase::exprs(DM1000discovery)))
+discoveryLab <- factor(DM1000discovery$Carcinogen_liv, levels = c("noncarc", "carc"))
+validation <- data.frame(t(Biobase::exprs(DM1000validation)))
+validationLab <- factor(DM1000validation$Carcinogen_liv, levels = c("noncarc", "carc"))
+ 
+ ###     
+ mine
+ ```{r}
+CPM3_idx <- createDataPartition(CPM3_notAE$grade, p=0.6, list=FALSE, times=1)
+CPM3_train <- CPM3_notAE[, CPM3_idx]
+CPM3_test <- CPM3_notAE[, -CPM3_idx]
+```
+##
+#CPM3_test <- CPM3_notAE[, -CPM3_idx]
+validation <- data.frame(t(Biobase::exprs(DM1000vali)))
+
+test <-data.frame(t(Biobase::exprs(CPM3_test)))
+
+result <- featureSelect(CPM3_train, CPM3_train$grade == "g1", 20)
+train_x <- data.frame(t(Biobase::exprs(result$dat)))
+train_y <- result$dat$grade
+fitControl <- trainControl(method="cv",
+                           number=10,
+                           classProbs=T,
+                           summaryFunction=twoClassSummary)
+#testing
+result1 <- featureSelect(CPM3_test, CPM3_test$grade == "g1", 20)
+test_x <- data.frame(t(Biobase::exprs(result1$dat)))
+test_y <- result$dat$grade
+fitControl <- trainControl(method="cv",
+                           number=10,
+                           classProbs=T,
+                           summaryFunction=twoClassSummary)
+
+
+RF_20 <- train(x=train_x,
+             y=train_y,
+             method="rf", # random forest 
+             trControl=fitControl,
+             tuneGrid=expand.grid(mtry=c(20, 50, 100,500)),
+             metric='ROC') 
+ 
+ 
+
+### SVM Model
+```{r}
+# 20
+## SVM with 5x cross validation
+fitControl <- trainControl(method="cv",
+                           number=10,
+                           classProbs=T,
+                           summaryFunction=twoClassSummary)
+set.seed(1234) # for reproducible results
+## evaluate on train set based on area under the ROC (AUC)
+
+
+
+SVM <- train(x=train_x,
+             y=train_y,
+             method="svmLinear2",
+             trControl=fitControl,
+             tuneGrid=expand.grid(cost=10^(seq(-4.5, -3, by = 0.20))),
+             metric='ROC')
+
+```
+
+```{r}
+## summary of performance across each value of tuning parameters
+SVM
+```
+
+```{r}
+plot(SVM, metric = "ROC")
+
+```
+
+```{r}
+## show the parameters that yield the most accurate classifier (as estimated by cv)
+SVM$bestTune
+
+```
+
+
+```{r}
+#final model used and performance across test sets of each fold
+SVM$finalModel
+
+```
+
+
+```{r}
+#50 balanced features
+#final model used and performance across test sets of each fold
+SVM50 <- train(x=train_x,
+             y=train_y,
+             method="svmLinear2",
+             trControl=fitControl,
+             tuneGrid=expand.grid(cost=10^(seq(-4.5, -3, by = 0.50))),
+             metric='ROC')
+
+```
+
+## This has the highest specificity
+```{r}
+## summary of performance across each value of tuning parameters
+SVM50
+```
+
+```{r}
+plot(SVM50, metric = "ROC")
+
+```
+
+```{r}
+## show the parameters that yield the most accurate classifier (as estimated by cv)
+SVM50$bestTune
+```
+
+```{r}
+#100 balanced features
+#final model used and performance across test sets of each fold
+SVM100 <- train(x=train_x,
+             y=train_y,
+             method="svmLinear2",
+             trControl=fitControl,
+             tuneGrid=expand.grid(cost=10^(seq(-4.5, -3, by = 1.0))),
+             metric='ROC')
+
+```
+
+
+```{r}
+## summary of performance across each value of tuning parameters
+SVM100
+```
+
+```{r}
+
+plot(SVM100, metric = "ROC")
+
+```
+
+```{r}
+#500 balanced features
+#final model used and performance across test sets of each fold
+SVM500 <- train(x=train_x,
+             y=train_y,
+             method="svmLinear2",
+             trControl=fitControl,
+             tuneGrid=expand.grid(cost=10^(seq(-4.5, -3, by = 5.0))),
+             metric='ROC')
+
+```
+
+```{r}
+## summary of performance across each value of tuning parameters
+SVM500
+```
+
+###
+```#{r EVAL=TRUE}
+#plot(SVM500, metric = "ROC")
+
+```
